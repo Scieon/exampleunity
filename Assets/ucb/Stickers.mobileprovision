@@ -6,7 +6,5 @@ lane :use_stickers_profile do |options|
         target_filter: 'Unity-iPhone-Stickers',
         profile: profile_path
     ),
-    xcargs: {
-        useModernBuildSystem: "YES"
-    },
+    xcargs: "-UseNewBuildSystem=YES"
 end
