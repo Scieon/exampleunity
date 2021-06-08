@@ -1,0 +1,194 @@
+fastlane_require 'json'
+fastlane_require 'plist'
+fastlane_require 'xcodeproj'
+fastlane_require 'gym/options'
+
+fastlane_version '2.182.0'
+
+default_platform :ios
+
+platform :ios do
+  def recursive_merge(a, b)
+    a.merge(b) {|key, _old, _new| if _old.class == Hash then recursive_merge(_old, _new) else _new end }
+  end
+
+  def transform_keys_to_symbols(value)
+    return value unless value.is_a?(Hash)
+    value.inject({}){|memo,(key,val)|
+      key_sym = key.to_sym
+      # HACK to prevent provisioningProfiles keys from getting symbolized
+      unless key_sym == :provisioningProfiles
+        val = transform_keys_to_symbols(val)
+      end
+      memo[key_sym] = val
+      memo
+    }
+  end
+
+  def get_entitlements_file
+    project = Xcodeproj::Project.open('../Unity-iPhone.xcodeproj')
+    return nil unless project
+    target = project.native_targets.find {|s| s.name == 'Unity-iPhone' }
+    return nil unless target
+    build_config = target.build_configurations.find {|s| s.name == 'Release' }
+    return nil unless build_config
+    build_config.build_settings['CODE_SIGN_ENTITLEMENTS']
+  end
+
+  #Tidy up the UnityFramework's targets to make sure that it's using manual code signing and that no provisioning profile is set
+  def update_framework_target
+    project = Xcodeproj::Project.open('../Unity-iPhone.xcodeproj')
+    project.targets.each do |target|
+       if target.name == 'UnityFramework'
+         target.build_configurations.each do |config|
+            config.build_settings['CODE_SIGN_STYLE'] = 'Manual'
+            config.build_settings['PROVISIONING_PROFILE'] = ''
+         end
+       end
+    end
+    project.save
+  end
+
+  def run_user_lane(options, user_config, lane_key)
+    user_lane_options = {
+        output_directory: options[:output_directory],
+        project_dir: options[:project_dir],
+        build_target: options[:build_target]
+    }
+
+    user_lanes = user_config[:lanes] || {}
+    lane_name = user_lanes[lane_key]
+    unless lane_name.nil? || lane_name.empty?
+      begin
+        self.runner.try_switch_to_lane(lane_name.to_sym, [user_lane_options])
+      rescue Fastlane::Runner::LaneNotAvailableError
+        puts "User Lane '#{lane_name}' was not found!"
+      end
+    end
+  end
+
+  lane :build do |options|
+    user_fastlane_options = {}
+    user_fastlane_options_filename = options[:custom_fastlane_config_path]
+    if user_fastlane_options_filename.nil? || user_fastlane_options_filename.empty?
+        user_fastlane_options_filename = File.join('Assets', 'ucb_xcode_fastlane.json')
+    end
+    user_fastlane_options_path = File.join(options[:project_dir], user_fastlane_options_filename)
+    if File.exists?(user_fastlane_options_path)
+      puts "Found user UCB fastlane options at #{user_fastlane_options_filename}"
+      user_fastlane_options = JSON.parse(File.read(user_fastlane_options_path))
+      target_id = options[:build_target]
+      if user_fastlane_options.has_key? target_id
+        user_fastlane_options = user_fastlane_options[target_id]
+      end
+      user_fastlane_options = transform_keys_to_symbols(user_fastlane_options)
+    end
+
+    # import user Fastfile
+    user_fastfile = user_fastlane_options[:fastfile]
+    if user_fastfile
+      user_fastfile_path = File.join(options[:project_dir], user_fastfile)
+      if File.exists? user_fastfile_path
+        puts "Importing user Fastfile at: #{user_fastfile}"
+        import user_fastfile_path
+      else
+        puts "! No user Fastfile found at path: #{user_fastfile}"
+      end
+    end
+
+    # set some basic Info.plist values
+    if options[:bundleIdentifier]
+      set_info_plist_value(path: './Info.plist', key: 'CFBundleIdentifier', value: options[:bundleIdentifier])
+    end
+
+    if options[:bundleVersion]
+      set_info_plist_value(path: './Info.plist', key: 'CFBundleVersion', value: options[:bundleVersion])
+    end
+
+    if options[:versionString]
+      set_info_plist_value(path: './Info.plist', key: 'CFBundleShortVersionString', value: options[:versionString])
+    end
+
+    # Force manual provisioning with the specified profile
+    update_project_provisioning(
+      xcodeproj: 'Unity-iPhone.xcodeproj',
+      profile: File.expand_path("~/Library/MobileDevice/Provisioning Profiles/#{options[:prov_profile_guid]}.mobileprovision")
+    )
+    update_framework_target
+
+    sh("sed -i '' '/PROVISIONING_PROFILE_SPECIFIER/d;/DEVELOPMENT_TEAM/d' ../Unity-iPhone.xcodeproj/project.pbxproj")
+
+    # run user pre-build lane
+    run_user_lane(options, user_fastlane_options, :pre_build)
+
+    # generate default gym options
+    gym_options = {
+        output_directory: options[:output_directory],
+        scheme: options[:scheme],
+        codesigning_identity: options[:codesigning_identity],
+        export_team_id: options[:export_team_id],
+        include_symbols: options[:export_method] == 'app-store' ? true : false,
+        skip_profile_detection: true,
+        export_options: {
+            method: options[:export_method],
+            uploadSymbols: options[:export_method] == 'app-store' ? true : false,
+            provisioningProfiles: {
+                options[:bundleIdentifier] => options[:prov_profile_guid]
+            }
+        },
+        xcargs: "-UseNewBuildSystem=YES"
+    }
+
+    # detect cloudkit usage
+    entitlements_file = get_entitlements_file
+    if entitlements_file
+      entitlements_file = File.expand_path File.join(File.dirname(__FILE__), '..', entitlements_file)
+      if File.exists? entitlements_file
+        entitlements_plist = Plist.parse_xml entitlements_file
+        entitlements = entitlements_plist['com.apple.developer.icloud-services'] || []
+        if entitlements.include? 'CloudKit'
+          gym_options[:export_options][:iCloudContainerEnvironment] = 'Production'
+        end
+      end
+    end
+
+    # load user gymfile options
+    user_gymfile = user_fastlane_options[:gymfile]
+    if user_gymfile
+      # copy user gymfile to fastlane/GymfileUser
+      user_gymfile = File.join(options[:project_dir], user_gymfile)
+      dest_gymfile = File.join(File.dirname(__FILE__), 'GymfileUser')
+      FileUtils.cp(user_gymfile, dest_gymfile)
+
+      # load user gym config
+      user_gym_config = FastlaneCore::Configuration.create(::Gym::Options.available_options, {})
+      user_gym_config.load_configuration_file('GymfileUser')
+
+      # convert config to hash and merge with default options
+      user_gym_options = {}.merge(user_gym_config.values)
+      user_gym_options.reject! {|k,v| v.nil? }
+      blacklist_keys = [:output_directory, :output_name, :skip_profile_detection, :clean]
+      user_gym_options.reject! {|k,v| blacklist_keys.include?(k) }
+      gym_options = recursive_merge(gym_options, user_gym_options)
+    end
+
+    # run gym (i.e. the actual build step)
+    gym(gym_options)
+
+    # run user post-build lane
+    run_user_lane(options, user_fastlane_options, :post_build)
+  end
+end
+
+platform :mac do
+  lane :notarize_build do |options|
+    notarize_options = {
+        package: options[:app_path],
+        bundle_id: options[:bundle],
+        asc_provider: options[:provider_short_name],
+        print_log:true,
+        verbose: options[:verbose]
+    }
+    notarize(notarize_options)
+  end
+end
